@@ -5,13 +5,49 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+
 #include "api.h"
+
+#ifndef PATH_RESERVED
+  #define PATH_RESERVED 4096
+#endif
+
+static int linux_native_make_temp_path(char *out, size_t out_size) {
+  char tmpl[64];
+  if (sizeof(tmpl) < 32) { return -1; }
+  int written = snprintf(tmpl, sizeof(tmpl), "/tmp/lite_folder_XXXXXX");
+  if (written < 0 || (size_t)written >= sizeof(tmpl)) { return -1; }
+  int fd = mkstemp(tmpl);
+  if (fd < 0) { return -1; }
+  close(fd);
+  if ((size_t)written >= out_size) { return -1; }
+  memcpy(out, tmpl, written + 1);
+  return 0;
+}
+
+static int linux_native_resolve_exe_dir(char *out, size_t out_size) {
+  char buf[PATH_RESERVED];
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n <= 0) { return -1; }
+  buf[n] = '\0';
+  char *slash = strrchr(buf, '/');
+  if (!slash) { return -1; }
+  *slash = '\0';
+  size_t len = strlen(buf);
+  if (len + 1 > out_size) { return -1; }
+  memcpy(out, buf, len + 1);
+  return 0;
+}
+
 #include "rencache.h"
 #ifdef _WIN32
   #include <windows.h>
   #include <shlobj.h>
+  #include <direct.h>
 #endif
 
 extern SDL_Window *window;
@@ -220,6 +256,22 @@ static int f_chdir(lua_State *L) {
   int err = chdir(path);
   if (err) { luaL_error(L, "chdir() failed"); }
   return 0;
+}
+
+static int f_mkdir(lua_State *L) {
+  const char *path = luaL_checkstring(L, 1);
+#ifdef _WIN32
+  int err = _mkdir(path);
+#else
+  int err = mkdir(path, 0755);
+#endif
+  if (err) {
+    lua_pushnil(L);
+    lua_pushstring(L, strerror(errno));
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
 }
 
 static int f_list_dir(lua_State *L) {
@@ -441,85 +493,90 @@ static int f_show_open_folder_dialog_native(lua_State *L) {
   /*
    ** On Linux we do not initialise GTK in this process, so we cannot host the
    ** folder chooser here. Instead we spawn a tiny GTK4 helper process that
-   ** shows a native folder chooser and writes the chosen path to stdout.
+   ** shows a native folder chooser and writes the chosen path to a temp file.
    */
-  char tmp_path[64];
-  int tmp_fd = -1;
-
-  {
-    const char *template = "/tmp/lite_folder_XXXXXX";
-    tmp_fd = mkstemp(tmp_path);
-    if (tmp_fd < 0) { goto linux_native_fail; }
-    close(tmp_fd);
-    tmp_fd = -1;
+  char tmp_path[64] = {0};
+  if (linux_native_make_temp_path(tmp_path, sizeof(tmp_path)) != 0) {
+    goto linux_native_unavailable;
   }
 
-  {
-    char exe_buf[4096];
-    ssize_t n = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-    if (n <= 0) { unlink(tmp_path); goto linux_native_fail; }
-    exe_buf[n] = '\0';
-
-    char argv_buf[8192];
-    const char *home_dir = getenv("HOME");
-    const char *start_dir = home_dir ? home_dir : "/home";
-    int argv_len = snprintf(argv_buf, sizeof(argv_buf),
-        "%s --lite-folder-chooser %s %s %s", exe_buf, tmp_path,
-        title ? title : "Choose Folder", start_dir);
-    if (argv_len < 0 || (size_t)argv_len >= sizeof(argv_buf)) {
-      unlink(tmp_path);
-      goto linux_native_fail;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-      unlink(tmp_path);
-      goto linux_native_fail;
-    }
-    if (pid == 0) {
-      execl("/bin/sh", "sh", "-c", argv_buf, (char *)NULL);
-      _exit(127);
-    }
-
-    int status = 0;
-    pid_t ret = waitpid(pid, &status, 0);
-    if (ret != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      unlink(tmp_path);
-      goto linux_native_fail;
-    }
+  char exe_dir[PATH_RESERVED];
+  if (linux_native_resolve_exe_dir(exe_dir, sizeof(exe_dir)) != 0) {
+    goto linux_native_unavailable;
   }
 
-  {
-    FILE *f = fopen(tmp_path, "r");
-    if (!f) { unlink(tmp_path); goto linux_native_fail; }
-    char buf[4096];
-    if (!fgets(buf, sizeof(buf), f)) {
-      fclose(f);
-      unlink(tmp_path);
-      goto linux_native_fail;
-    }
+  char helper_path[PATH_RESERVED];
+  int hp_len = snprintf(helper_path, sizeof(helper_path),
+      "%s/lite_folder_chooser_helper", exe_dir);
+  if (hp_len < 0 || (size_t)hp_len >= sizeof(helper_path)) {
+    goto linux_native_unavailable;
+  }
+  if (access(helper_path, X_OK) != 0) {
+    goto linux_native_unavailable;
+  }
+
+  const char *home_dir = getenv("HOME");
+  const char *start_dir = home_dir ? home_dir : "/home";
+
+  char argv_buf[8192];
+  int argv_len = snprintf(argv_buf, sizeof(argv_buf),
+      "%s --lite-folder-chooser %s %s %s", helper_path, tmp_path,
+      title ? title : "Choose Folder", start_dir);
+  if (argv_len < 0 || (size_t)argv_len >= sizeof(argv_buf)) {
+    goto linux_native_unavailable;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    goto linux_native_unavailable;
+  }
+  if (pid == 0) {
+    execl("/bin/sh", "sh", "-c", argv_buf, (char *)NULL);
+    _exit(127);
+  }
+
+  int status = 0;
+  pid_t ret = waitpid(pid, &status, 0);
+  if (ret != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    /* Non-zero from the helper means the user cancelled the dialog. */
+    goto linux_native_cancelled;
+  }
+
+  FILE *f = fopen(tmp_path, "r");
+  if (!f) { goto linux_native_cancelled; }
+  char buf[4096];
+  if (!fgets(buf, sizeof(buf), f)) {
     fclose(f);
-    unlink(tmp_path);
-
-    size_t len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-      buf[--len] = '\0';
-    }
-    if (len == 0) { goto linux_native_fail; }
-
-    char *real = realpath(buf, NULL);
-    if (real) {
-      lua_pushstring(L, real);
-      free(real);
-    } else {
-      lua_pushstring(L, buf);
-    }
-    return 1;
+    goto linux_native_cancelled;
   }
+  fclose(f);
 
-linux_native_fail:
+  size_t len = strlen(buf);
+  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+    buf[--len] = '\0';
+  }
+  unlink(tmp_path);
+  if (len == 0) { goto linux_native_cancelled; }
+
+  char *real = realpath(buf, NULL);
+  if (real) {
+    lua_pushstring(L, real);
+    free(real);
+  } else {
+    lua_pushstring(L, buf);
+  }
+  return 1;
+
+linux_native_cancelled:
+  if (tmp_path[0]) { unlink(tmp_path); }
   lua_pushnil(L);
   return 1;
+
+linux_native_unavailable:
+  if (tmp_path[0]) { unlink(tmp_path); }
+  lua_pushnil(L);
+  lua_pushstring(L, "native folder dialog is not available on this system");
+  return 2;
 
 #else
   SDL_MessageBoxButtonData buttons[] = {
@@ -551,6 +608,7 @@ static const luaL_Reg lib[] = {
   { "show_open_folder_dialog",          f_show_open_folder_dialog          },
   { "show_open_folder_dialog_native",   f_show_open_folder_dialog_native   },
   { "chdir",                            f_chdir                            },
+  { "mkdir",                            f_mkdir                            },
   { "list_dir",                f_list_dir                },
   { "absolute_path",           f_absolute_path           },
   { "get_file_info",           f_get_file_info           },

@@ -229,6 +229,16 @@ function core.add_thread(f, weak_ref)
 end
 
 
+-- wake all background threads, so the project file list is rebuilt right away
+-- (used after creating or deleting files, which would otherwise take up to
+-- config.project_scan_rate seconds to show up)
+function core.rescan_project()
+  for _, thread in pairs(core.threads) do
+    thread.wake = 0
+  end
+end
+
+
 function core.push_clip_rect(x, y, w, h)
   local x2, y2, w2, h2 = table.unpack(core.clip_rect_stack[#core.clip_rect_stack])
   local r, b, r2, b2 = x+w, y+h, x2+w2, y2+h2

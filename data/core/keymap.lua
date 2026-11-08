@@ -4,6 +4,10 @@ local keymap = {}
 keymap.modkeys = {}
 keymap.map = {}
 keymap.reverse_map = {}
+keymap.pending = nil       -- accumulated strokes for multi-stroke bindings
+keymap.pending_time = 0   -- system.get_time() when the pending chord started
+
+local pending_timeout = 1.5  -- seconds before an incomplete chord expires
 
 local modkey_map = {
   ["left ctrl"]   = "ctrl",
@@ -52,6 +56,24 @@ function keymap.get_binding(cmd)
 end
 
 
+local function has_prefix(stroke)
+  for bound in pairs(keymap.map) do
+    if bound:sub(1, #stroke + 1) == stroke .. " " then
+      return true
+    end
+  end
+  return false
+end
+
+
+local function run_commands(commands)
+  for _, cmd in ipairs(commands) do
+    local performed = command.perform(cmd)
+    if performed then break end
+  end
+end
+
+
 function keymap.on_key_pressed(k)
   local mk = modkey_map[k]
   if mk then
@@ -62,12 +84,39 @@ function keymap.on_key_pressed(k)
     end
   else
     local stroke = key_to_stroke(k)
+
+    -- expire a stale in-progress chord
+    if keymap.pending and system.get_time() - keymap.pending_time > pending_timeout then
+      keymap.pending = nil
+    end
+
+    if keymap.pending then
+      local full = keymap.pending .. " " .. stroke
+      local commands = keymap.map[full]
+      if commands then
+        keymap.pending = nil
+        run_commands(commands)
+        return true
+      elseif has_prefix(full) then
+        -- still mid-chord: keep waiting for the next key
+        keymap.pending = full
+        keymap.pending_time = system.get_time()
+        return true
+      end
+      -- no match: drop the chord and handle this key on its own
+      keymap.pending = nil
+    end
+
+    -- start a chord when this stroke only leads to longer bindings
+    if not keymap.map[stroke] and has_prefix(stroke) then
+      keymap.pending = stroke
+      keymap.pending_time = system.get_time()
+      return true
+    end
+
     local commands = keymap.map[stroke]
     if commands then
-      for _, cmd in ipairs(commands) do
-        local performed = command.perform(cmd)
-        if performed then break end
-      end
+      run_commands(commands)
       return true
     end
   end

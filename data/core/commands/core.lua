@@ -113,8 +113,10 @@ command.add(nil, {
   end,
 
   ["core:open-folder-native"] = function()
-    local ok, folder = pcall(system.show_open_folder_dialog_native, "Open Folder")
-    if ok and folder then
+    local ok, folder, reason = pcall(system.show_open_folder_dialog_native, "Open Folder")
+    if not ok then
+      core.error("Native folder dialog not available on this platform")
+    elseif folder then
       local info = system.get_file_info(folder)
       if info and info.type == "dir" then
         system.chdir(folder)
@@ -122,8 +124,8 @@ command.add(nil, {
       else
         core.error("Selected path is not a folder")
       end
-    elseif not ok then
-      core.error("Native folder dialog not available on this platform")
+    elseif reason then
+      core.error("%s", reason)
     end
   end,
 })
