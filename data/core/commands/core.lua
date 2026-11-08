@@ -98,4 +98,32 @@ command.add(nil, {
       doc:save(filename)
     end
   end,
+
+  ["core:open-folder"] = function()
+    local folder = system.show_open_folder_dialog("Open Folder")
+    if folder then
+      local info = system.get_file_info(folder)
+      if info and info.type == "dir" then
+        system.chdir(folder)
+        core.log("Opened folder %q", folder)
+      else
+        core.error("Selected path is not a folder")
+      end
+    end
+  end,
+
+  ["core:open-folder-native"] = function()
+    local ok, folder = pcall(system.show_open_folder_dialog_native, "Open Folder")
+    if ok and folder then
+      local info = system.get_file_info(folder)
+      if info and info.type == "dir" then
+        system.chdir(folder)
+        core.log("Opened folder %q", folder)
+      else
+        core.error("Selected path is not a folder")
+      end
+    elseif not ok then
+      core.error("Native folder dialog not available on this platform")
+    end
+  end,
 })

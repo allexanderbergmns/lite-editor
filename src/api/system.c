@@ -5,14 +5,16 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <stdlib.h>
+#include <string.h>
 #include "api.h"
 #include "rencache.h"
 #ifdef _WIN32
   #include <windows.h>
+  #include <shlobj.h>
 #endif
 
 extern SDL_Window *window;
-
 
 static const char* button_name(int button) {
   switch (button) {
@@ -23,7 +25,6 @@ static const char* button_name(int button) {
   }
 }
 
-
 static char* key_name(char *dst, int sym) {
   strcpy(dst, SDL_GetKeyName(sym));
   char *p = dst;
@@ -33,7 +34,6 @@ static char* key_name(char *dst, int sym) {
   }
   return dst;
 }
-
 
 static int f_poll_event(lua_State *L) {
   char buf[16];
@@ -61,9 +61,6 @@ top:
         lua_pushstring(L, "exposed");
         return 1;
       }
-      /* on some systems, when alt-tabbing to the window SDL will queue up
-      ** several KEYDOWN events for the `tab` key; we flush all keydown
-      ** events on focus so these are discarded */
       if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
         SDL_FlushEvent(SDL_KEYDOWN);
       }
@@ -131,13 +128,11 @@ top:
   return 0;
 }
 
-
 static int f_wait_event(lua_State *L) {
   double n = luaL_checknumber(L, 1);
   lua_pushboolean(L, SDL_WaitEventTimeout(NULL, n * 1000));
   return 1;
 }
-
 
 static SDL_Cursor* cursor_cache[SDL_SYSTEM_CURSOR_HAND + 1];
 
@@ -170,13 +165,11 @@ static int f_set_cursor(lua_State *L) {
   return 0;
 }
 
-
 static int f_set_window_title(lua_State *L) {
   const char *title = luaL_checkstring(L, 1);
   SDL_SetWindowTitle(window, title);
   return 0;
 }
-
 
 static const char *window_opts[] = { "normal", "maximized", "fullscreen", 0 };
 enum { WIN_NORMAL, WIN_MAXIMIZED, WIN_FULLSCREEN };
@@ -190,13 +183,11 @@ static int f_set_window_mode(lua_State *L) {
   return 0;
 }
 
-
 static int f_window_has_focus(lua_State *L) {
   unsigned flags = SDL_GetWindowFlags(window);
   lua_pushboolean(L, flags & SDL_WINDOW_INPUT_FOCUS);
   return 1;
 }
-
 
 static int f_show_confirm_dialog(lua_State *L) {
   const char *title = luaL_checkstring(L, 1);
@@ -224,14 +215,12 @@ static int f_show_confirm_dialog(lua_State *L) {
   return 1;
 }
 
-
 static int f_chdir(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
   int err = chdir(path);
   if (err) { luaL_error(L, "chdir() failed"); }
   return 0;
 }
-
 
 static int f_list_dir(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
@@ -258,21 +247,23 @@ static int f_list_dir(lua_State *L) {
   return 1;
 }
 
-
-#ifdef _WIN32
-  #include <windows.h>
-  #define realpath(x, y) _fullpath(y, x, MAX_PATH)
-#endif
-
 static int f_absolute_path(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
+
+#ifdef _WIN32
+  char path_buf[MAX_PATH];
+  if (!_fullpath(path_buf, path, MAX_PATH)) {
+    return 0;
+  }
+  lua_pushstring(L, path_buf);
+#else
   char *res = realpath(path, NULL);
   if (!res) { return 0; }
   lua_pushstring(L, res);
   free(res);
+#endif
   return 1;
 }
-
 
 static int f_get_file_info(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
@@ -304,7 +295,6 @@ static int f_get_file_info(lua_State *L) {
   return 1;
 }
 
-
 static int f_get_clipboard(lua_State *L) {
   char *text = SDL_GetClipboardText();
   if (!text) { return 0; }
@@ -313,13 +303,11 @@ static int f_get_clipboard(lua_State *L) {
   return 1;
 }
 
-
 static int f_set_clipboard(lua_State *L) {
   const char *text = luaL_checkstring(L, 1);
   SDL_SetClipboardText(text);
   return 0;
 }
-
 
 static int f_get_time(lua_State *L) {
   double n = SDL_GetPerformanceCounter() / (double) SDL_GetPerformanceFrequency();
@@ -327,13 +315,11 @@ static int f_get_time(lua_State *L) {
   return 1;
 }
 
-
 static int f_sleep(lua_State *L) {
   double n = luaL_checknumber(L, 1);
   SDL_Delay(n * 1000);
   return 0;
 }
-
 
 static int f_exec(lua_State *L) {
   size_t len;
@@ -351,7 +337,6 @@ static int f_exec(lua_State *L) {
   free(buf);
   return 0;
 }
-
 
 static int f_fuzzy_match(lua_State *L) {
   const char *str = luaL_checkstring(L, 1);
@@ -379,27 +364,204 @@ static int f_fuzzy_match(lua_State *L) {
 }
 
 
+static int f_show_open_folder_dialog(lua_State *L) {
+  const char *title = luaL_checkstring(L, 1);
+#if _WIN32
+  BROWSEINFO bi = {0};
+  bi.lpszTitle = title;
+  bi.ulFlags = BIF_USENEWUI | BIF_RETURNONLYFSDIRS;
+  LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+  if (!pidl) { return 0; }
+  char path[MAX_PATH];
+  if (SHGetPathFromIDList(pidl, path)) {
+    lua_pushstring(L, path);
+  } else {
+    lua_pushnil(L);
+  }
+  CoTaskMemFree(pidl);
+#else
+  SDL_MessageBoxButtonData buttons[] = {
+    { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Open" },
+    { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel" },
+  };
+  SDL_MessageBoxData data = {
+    .title = title,
+    .message = "Please use the system file manager to choose a folder.",
+    .numbuttons = 2,
+    .buttons = buttons,
+  };
+  int buttonid;
+  SDL_ShowMessageBox(&data, &buttonid);
+  lua_pushnil(L);
+  (void) buttonid;
+#endif
+  return 1;
+}
+
+
+static int f_show_open_folder_dialog_native(lua_State *L) {
+  const char *title = luaL_checkstring(L, 1);
+
+#if _WIN32
+  BROWSEINFO bi = {0};
+  bi.lpszTitle = title;
+  bi.ulFlags = BIF_USENEWUI | BIF_RETURNONLYFSDIRS;
+  LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+  if (!pidl) { return 0; }
+  char path[MAX_PATH];
+  if (SHGetPathFromIDList(pidl, path)) {
+    lua_pushstring(L, path);
+  } else {
+    lua_pushnil(L);
+  }
+  CoTaskMemFree(pidl);
+
+#elif __APPLE__
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSSavePanel *panel = [NSSavePanel savePanel];
+  [panel setTitle:[NSString stringWithUTF8String:title]];
+  [panel setCanCreateDirectories:YES];
+  [panel setDirectoryURL:[NSURL fileURLWithPath:NSHomeDirectory() isDirectory:YES]];
+  [panel setPrompt:@"Choose"];
+  [panel setAllowedFileTypes:@[@""]];
+  if ([panel runModal] == NSModalResponseOK) {
+    NSString *selected = [[panel URL] path];
+    if (selected) {
+      const char *utf8 = [selected UTF8String];
+      lua_pushstring(L, utf8);
+    } else {
+      lua_pushnil(L);
+    }
+  } else {
+    lua_pushnil(L);
+  }
+  [pool drain];
+
+#elif __linux__
+  /*
+   ** On Linux we do not initialise GTK in this process, so we cannot host the
+   ** folder chooser here. Instead we spawn a tiny GTK4 helper process that
+   ** shows a native folder chooser and writes the chosen path to stdout.
+   */
+  char tmp_path[64];
+  int tmp_fd = -1;
+
+  {
+    const char *template = "/tmp/lite_folder_XXXXXX";
+    tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) { goto linux_native_fail; }
+    close(tmp_fd);
+    tmp_fd = -1;
+  }
+
+  {
+    char exe_buf[4096];
+    ssize_t n = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (n <= 0) { unlink(tmp_path); goto linux_native_fail; }
+    exe_buf[n] = '\0';
+
+    char argv_buf[8192];
+    const char *home_dir = getenv("HOME");
+    const char *start_dir = home_dir ? home_dir : "/home";
+    int argv_len = snprintf(argv_buf, sizeof(argv_buf),
+        "%s --lite-folder-chooser %s %s %s", exe_buf, tmp_path,
+        title ? title : "Choose Folder", start_dir);
+    if (argv_len < 0 || (size_t)argv_len >= sizeof(argv_buf)) {
+      unlink(tmp_path);
+      goto linux_native_fail;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+      unlink(tmp_path);
+      goto linux_native_fail;
+    }
+    if (pid == 0) {
+      execl("/bin/sh", "sh", "-c", argv_buf, (char *)NULL);
+      _exit(127);
+    }
+
+    int status = 0;
+    pid_t ret = waitpid(pid, &status, 0);
+    if (ret != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      unlink(tmp_path);
+      goto linux_native_fail;
+    }
+  }
+
+  {
+    FILE *f = fopen(tmp_path, "r");
+    if (!f) { unlink(tmp_path); goto linux_native_fail; }
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), f)) {
+      fclose(f);
+      unlink(tmp_path);
+      goto linux_native_fail;
+    }
+    fclose(f);
+    unlink(tmp_path);
+
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+      buf[--len] = '\0';
+    }
+    if (len == 0) { goto linux_native_fail; }
+
+    char *real = realpath(buf, NULL);
+    if (real) {
+      lua_pushstring(L, real);
+      free(real);
+    } else {
+      lua_pushstring(L, buf);
+    }
+    return 1;
+  }
+
+linux_native_fail:
+  lua_pushnil(L);
+  return 1;
+
+#else
+  SDL_MessageBoxButtonData buttons[] = {
+    { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Open" },
+    { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel" },
+  };
+  SDL_MessageBoxData data = {
+    .title = title,
+    .message = "Please use the system file manager to choose a folder.",
+    .numbuttons = 2,
+    .buttons = buttons,
+  };
+  int buttonid;
+  SDL_ShowMessageBox(&data, &buttonid);
+  lua_pushnil(L);
+  (void) buttonid;
+#endif
+  return 1;
+}
+
 static const luaL_Reg lib[] = {
-  { "poll_event",          f_poll_event          },
-  { "wait_event",          f_wait_event          },
-  { "set_cursor",          f_set_cursor          },
-  { "set_window_title",    f_set_window_title    },
-  { "set_window_mode",     f_set_window_mode     },
-  { "window_has_focus",    f_window_has_focus    },
-  { "show_confirm_dialog", f_show_confirm_dialog },
-  { "chdir",               f_chdir               },
-  { "list_dir",            f_list_dir            },
-  { "absolute_path",       f_absolute_path       },
-  { "get_file_info",       f_get_file_info       },
-  { "get_clipboard",       f_get_clipboard       },
-  { "set_clipboard",       f_set_clipboard       },
-  { "get_time",            f_get_time            },
-  { "sleep",               f_sleep               },
-  { "exec",                f_exec                },
-  { "fuzzy_match",         f_fuzzy_match         },
+  { "poll_event",              f_poll_event              },
+  { "wait_event",              f_wait_event              },
+  { "set_cursor",              f_set_cursor              },
+  { "set_window_title",        f_set_window_title        },
+  { "set_window_mode",         f_set_window_mode         },
+  { "window_has_focus",        f_window_has_focus        },
+  { "show_confirm_dialog",     f_show_confirm_dialog     },
+  { "show_open_folder_dialog",          f_show_open_folder_dialog          },
+  { "show_open_folder_dialog_native",   f_show_open_folder_dialog_native   },
+  { "chdir",                            f_chdir                            },
+  { "list_dir",                f_list_dir                },
+  { "absolute_path",           f_absolute_path           },
+  { "get_file_info",           f_get_file_info           },
+  { "get_clipboard",           f_get_clipboard           },
+  { "set_clipboard",           f_set_clipboard           },
+  { "get_time",                f_get_time                },
+  { "sleep",                   f_sleep                   },
+  { "exec",                    f_exec                    },
+  { "fuzzy_match",             f_fuzzy_match             },
   { NULL, NULL }
 };
-
 
 int luaopen_system(lua_State *L) {
   luaL_newlib(L, lib);
